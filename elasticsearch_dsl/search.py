@@ -1,11 +1,15 @@
+import copy
+import collections
+
 from six import iteritems, string_types
 
 from elasticsearch.helpers import scan
+from elasticsearch.exceptions import TransportError
 
 from .query import Q, EMPTY_QUERY, Bool
 from .aggs import A, AggBase
-from .utils import DslBase
-from .result import Response, Result, SuggestResponse
+from .utils import DslBase, AttrDict
+from .response import Response, Hit, SuggestResponse
 from .connections import connections
 
 class QueryProxy(object):
@@ -25,7 +29,7 @@ class QueryProxy(object):
 
     def __call__(self, *args, **kwargs):
         s = self._search._clone()
-        getattr(s, self._attr_name)._proxied += Q(*args, **kwargs)
+        getattr(s, self._attr_name)._proxied &= Q(*args, **kwargs)
 
         # always return search to be chainable
         return s
@@ -38,6 +42,12 @@ class QueryProxy(object):
             self._proxied = Q(self._proxied.to_dict())
             setattr(self._proxied, attr_name, value)
         super(QueryProxy, self).__setattr__(attr_name, value)
+
+    def __getstate__(self):
+        return (self._search, self._proxied, self._attr_name)
+
+    def __setstate__(self, state):
+        self._search, self._proxied, self._attr_name = state
 
 
 class ProxyDescriptor(object):
@@ -83,7 +93,7 @@ class Request(object):
         if isinstance(doc_type, (tuple, list)):
             for dt in doc_type:
                 self._add_doc_type(dt)
-        elif isinstance(doc_type, dict):
+        elif isinstance(doc_type, collections.Mapping):
             self._doc_type.extend(doc_type.keys())
             self._doc_type_map.update(doc_type)
         elif doc_type:
@@ -92,11 +102,20 @@ class Request(object):
         self._params = {}
         self._extra = extra or {}
 
+    def __eq__(self, other):
+        return (
+            isinstance(other, Request) and
+            other._params == self._params and
+            other._index == self._index and
+            other._doc_type == self._doc_type and
+            other.to_dict() == self.to_dict()
+        )
+
     def params(self, **kwargs):
         """
         Specify query params to be used when executing the search. All the
         keyword arguments will override the current values. See
-        http://elasticsearch-py.readthedocs.org/en/master/api.html#elasticsearch.Elasticsearch.search
+        https://elasticsearch-py.readthedocs.io/en/master/api.html#elasticsearch.Elasticsearch.search
         for all available parameters.
 
         Example::
@@ -127,7 +146,7 @@ class Request(object):
 
     def _add_doc_type(self, doc_type):
         if hasattr(doc_type, '_doc_type'):
-            self._doc_type_map[doc_type._doc_type.name] = doc_type.from_es
+            self._doc_type_map[doc_type._doc_type.name] = doc_type
             doc_type = doc_type._doc_type.name
         self._doc_type.append(doc_type)
 
@@ -137,7 +156,7 @@ class Request(object):
         multiple. Values can be strings or subclasses of ``DocType``.
 
         You can also pass in any keyword arguments, mapping a doc_type to a
-        callback that should be used instead of the Result class.
+        callback that should be used instead of the Hit class.
 
         If no doc_type is supplied any information stored on the instance will
         be erased.
@@ -211,8 +230,6 @@ class Search(Request):
         self.aggs = AggsProxy(self)
         self._sort = []
         self._source = None
-        self._fields = None
-        self._partial_fields = {}
         self._highlight = {}
         self._highlight_opts = {}
         self._suggest = {}
@@ -224,6 +241,9 @@ class Search(Request):
 
     def filter(self, *args, **kwargs):
         return self.query(Bool(filter=[Q(*args, **kwargs)]))
+
+    def exclude(self, *args, **kwargs):
+        return self.query(Bool(filter=[~Q(*args, **kwargs)]))
 
     def __iter__(self):
         """
@@ -266,7 +286,7 @@ class Search(Request):
     @classmethod
     def from_dict(cls, d):
         """
-        Construct a `Search` instance from a raw dict containing the search
+        Construct a new `Search` instance from a raw dict containing the search
         body. Useful when migrating from raw dictionaries.
 
         Example::
@@ -295,9 +315,8 @@ class Search(Request):
 
         s._response_class = self._response_class
         s._sort = self._sort[:]
-        s._source = self._source.copy() if self._source else None
-        s._fields = self._fields[:] if self._fields else None
-        s._partial_fields = self._partial_fields.copy()
+        s._source = copy.copy(self._source) \
+            if self._source is not None else None
         s._highlight = self._highlight.copy()
         s._highlight_opts = self._highlight_opts.copy()
         s._suggest = self._suggest.copy()
@@ -339,10 +358,6 @@ class Search(Request):
             self._sort = d.pop('sort')
         if '_source' in d:
             self._source = d.pop('_source')
-        if 'fields' in d:
-            self._fields = d.pop('fields')
-        if 'partial_fields' in d:
-            self._partial_fields = d.pop('partial_fields')
         if 'highlight' in d:
             high = d.pop('highlight').copy()
             self._highlight = high.pop('fields')
@@ -383,7 +398,7 @@ class Search(Request):
         s._script_fields.update(kwargs)
         return s
 
-    def source(self, **kwargs):
+    def source(self, fields=None, **kwargs):
         """
         Selectively control how the _source field is returned.
 
@@ -407,7 +422,14 @@ class Search(Request):
         """
         s = self._clone()
 
-        if s._source is None:
+        if fields and kwargs:
+            raise ValueError("You cannot specify fields and kwargs at the same time.")
+
+        if fields is not None:
+            s._source = fields
+            return s
+
+        if kwargs and not isinstance(s._source, dict):
             s._source = {}
 
         for key, value in kwargs.items():
@@ -419,43 +441,6 @@ class Search(Request):
             else:
                 s._source[key] = value
 
-        return s
-
-    def fields(self, fields=None):
-        """
-        Selectively load specific stored fields for each document.
-
-        :arg fields: list of fields to return for each document
-
-        If ``fields`` is None, the entire document will be returned for
-        each hit.  If fields is the empty list, no fields will be
-        returned for each hit, just the metadata.
-        """
-        s = self._clone()
-        s._fields = fields
-        return s
-
-    def partial_fields(self, **partial):
-        """
-        Control which part of the fields to extract from the `_source` document
-
-        :kwargs partial: dict specifying which fields to extract from the source
-
-        An example usage would be:
-
-            s = Search().partial_fields(authors_data={
-                    'include': ['authors.*'],
-                    'exclude': ['authors.name']
-                })
-
-        which will include all fields from the `authors` nested property except for
-        each authors `name`
-
-        If ``partial`` is not provided, the whole `_source` will be fetched. Calling this multiple
-        times will override the previous values with the new ones.
-        """
-        s = self._clone()
-        s._partial_fields = partial
         return s
 
     def sort(self, *keys):
@@ -504,7 +489,7 @@ class Search(Request):
     def highlight(self, *fields, **kwargs):
         """
         Request highlighting of some fields. All keyword arguments passed in will be
-        used as parameters. Example::
+        used as parameters for all the fields in the ``fields`` parameter. Example::
 
             Search().highlight('title', 'body', fragment_size=50)
 
@@ -514,6 +499,20 @@ class Search(Request):
                 "highlight": {
                     "fields": {
                         "body": {"fragment_size": 50},
+                        "title": {"fragment_size": 50}
+                    }
+                }
+            }
+
+        If you want to have different options for different fields you can call ``highlight`` twice::
+
+            Search().highlight('title', fragment_size=50).highlight('body', fragment_size=100)
+
+        which will produce::
+            {
+                "highlight": {
+                    "fields": {
+                        "body": {"fragment_size": 100},
                         "title": {"fragment_size": 50}
                     }
                 }
@@ -554,11 +553,11 @@ class Search(Request):
         """
         d = {"query": self.query.to_dict()}
 
-        if self.post_filter:
-            d['post_filter'] = self.post_filter.to_dict()
-
         # count request doesn't care for sorting and other things
         if not count:
+            if self.post_filter:
+                d['post_filter'] = self.post_filter.to_dict()
+
             if self.aggs.aggs:
                 d.update(self.aggs.to_dict())
 
@@ -567,14 +566,8 @@ class Search(Request):
 
             d.update(self._extra)
 
-            if self._source:
+            if not self._source in (None, {}):
                 d['_source'] = self._source
-
-            if self._fields is not None:
-                d['fields'] = self._fields
-
-            if self._partial_fields:
-                d['partial_fields'] = self._partial_fields
 
             if self._highlight:
                 d['highlight'] = {'fields': self._highlight}
@@ -604,7 +597,8 @@ class Search(Request):
         return es.count(
             index=self._index,
             doc_type=self._doc_type,
-            body=d
+            body=d,
+            **self._params
         )['count']
 
     def execute(self, ignore_cache=False):
@@ -618,13 +612,13 @@ class Search(Request):
             es = connections.get_connection(self._using)
 
             self._response = self._response_class(
+                self,
                 es.search(
                     index=self._index,
                     doc_type=self._doc_type,
                     body=self.to_dict(),
                     **self._params
-                ),
-                callbacks=self._doc_type_map
+                )
             )
         return self._response
 
@@ -649,7 +643,7 @@ class Search(Request):
 
         Use ``params`` method to specify any additional arguments you with to
         pass to the underlying ``scan`` helper from ``elasticsearch-py`` -
-        http://elasticsearch-py.readthedocs.org/en/master/helpers.html#elasticsearch.helpers.scan
+        https://elasticsearch-py.readthedocs.io/en/master/helpers.html#elasticsearch.helpers.scan
 
         """
         es = connections.get_connection(self._using)
@@ -661,10 +655,33 @@ class Search(Request):
                 doc_type=self._doc_type,
                 **self._params
             ):
-            yield self._doc_type_map.get(hit['_type'], Result)(hit)
+            callback = self._doc_type_map.get(hit['_type'], Hit)
+            callback = getattr(callback, 'from_es', callback)
+            yield callback(hit)
+
+    def delete(self):
+        """
+        delete() executes the query by delegating to delete_by_query()
+        """
+
+        es = connections.get_connection(self._using)
+
+        return AttrDict(
+            es.delete_by_query(
+                index=self._index,
+                body=self.to_dict(),
+                doc_type=self._doc_type,
+                **self._params
+            )
+        )
+
 
 
 class MultiSearch(Request):
+    """
+    Combine multiple :class:`~elasticsearch_dsl.Search` objects into a single
+    request.
+    """
     def __init__(self, **kwargs):
         super(MultiSearch, self).__init__(**kwargs)
         self._searches = []
@@ -681,6 +698,13 @@ class MultiSearch(Request):
         return ms
 
     def add(self, search):
+        """
+        Adds a new :class:`~elasticsearch_dsl.Search` object to the request::
+
+            ms = MultiSearch(index='my-index')
+            ms = ms.add(Search(doc_type=Category).filter('term', category='python'))
+            ms = ms.add(Search(doc_type=Blog))
+        """
         ms = self._clone()
         ms._searches.append(search)
         return ms
@@ -700,7 +724,10 @@ class MultiSearch(Request):
 
         return out
 
-    def execute(self, ignore_cache=False):
+    def execute(self, ignore_cache=False, raise_on_error=True):
+        """
+        Execute the multi search request and return a list of search results.
+        """
         if ignore_cache or not hasattr(self, '_response'):
             es = connections.get_connection(self._using)
 
@@ -713,8 +740,12 @@ class MultiSearch(Request):
 
             out = []
             for s, r in zip(self._searches, responses['responses']):
-                r = Response(r, callbacks=s._doc_type_map)
-                r.search = s
+                if r.get('error', False):
+                    if raise_on_error:
+                        raise TransportError('N/A', r['error']['type'], r['error'])
+                    r = None
+                else:
+                    r = Response(s, r)
                 out.append(r)
 
             self._response = out

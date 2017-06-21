@@ -28,6 +28,9 @@ def test_bool_to_dict():
 
     assert {"bool": {"must": [{"match": {"f": "value"}}]}} == bool.to_dict()
 
+def test_dismax_to_dict():
+    assert {"dis_max":{"queries": [{"term": {"_type": "article"}}]}} == query.DisMax(queries=[query.Term(_type='article')]).to_dict()
+
 def test_bool_from_dict_issue_318():
     d = {
         "bool": {
@@ -60,7 +63,7 @@ def test_bool_converts_its_init_args_to_queries():
 def test_two_queries_make_a_bool():
     q1 = query.Match(f='value1')
     q2 = query.Match(message={"query": "this is a test", "opeartor": "and"})
-    q = q1 + q2
+    q = q1 & q2
 
     assert isinstance(q, query.Bool)
     assert [q1, q2] == q.must
@@ -69,7 +72,7 @@ def test_other_and_bool_appends_other_to_must():
     q1 = query.Match(f='value1')
     qb = query.Bool()
 
-    q = q1 + qb
+    q = q1 & qb
     assert q is not qb
     assert q.must[0] == q1
 
@@ -77,19 +80,26 @@ def test_bool_and_other_appends_other_to_must():
     q1 = query.Match(f='value1')
     qb = query.Bool()
 
-    q = qb + q1
+    q = qb & q1
     assert q is not qb
     assert q.must[0] == q1
 
-def test_two_bools_are_combined():
-    q1 = query.Bool(must=[query.MatchAll(), query.Match(f=42)], should=[query.Match(g="v")])
-    q2 = query.Bool(must=[query.Match(x=42)], should=[query.Match(g="v2")], must_not=[query.Match(title='value')])
+def test_bool_and_other_sets_min_should_match_if_needed():
+    q1 = query.Q('term', category=1)
+    q2 = query.Q('bool', should=[
+        query.Q('term', name='aaa'),
+        query.Q('term', name='bbb')]
+    )
 
-    q = q1 + q2
-    assert isinstance(q, query.Bool)
-    assert q.must == [query.MatchAll(), query.Match(f=42), query.Match(x=42)]
-    assert q.should == [query.Match(g="v"), query.Match(g="v2")]
-    assert q.must_not == [query.Match(title='value')]
+    q = q1 & q2
+    assert q == query.Bool(
+        must=[q1],
+        should=[query.Q('term', name='aaa'), query.Q('term', name='bbb')],
+        minimum_should_match=1
+    )
+
+def test_empty_bool_has_min_should_match_0():
+    assert 0 == query.Bool()._min_should_match
 
 def test_query_and_query_creates_bool():
     q1 = query.Match(f=42)
@@ -119,9 +129,31 @@ def test_bool_and_bool():
 
 def test_inverted_query_becomes_bool_with_must_not():
     q = query.Match(f=42)
-    q = ~q
 
-    assert q == query.Bool(must_not=[query.Match(f=42)])
+    assert ~q == query.Bool(must_not=[query.Match(f=42)])
+
+def test_inverted_query_with_must_not_become_should():
+    q = query.Q('bool', must_not=[query.Q('match', f=1), query.Q('match', f=2)])
+
+    assert ~q == query.Q('bool', should=[query.Q('match', f=1), query.Q('match', f=2)])
+
+def test_inverted_query_with_must_and_must_not():
+    q = query.Q('bool',
+        must=[query.Q('match', f=3), query.Q('match', f=4)],
+        must_not=[query.Q('match', f=1), query.Q('match', f=2)]
+    )
+    print((~q).to_dict())
+    assert ~q == query.Q('bool',
+        should=[
+            # negation of must
+            query.Q('bool', must_not=[query.Q('match', f=3)]),
+            query.Q('bool', must_not=[query.Q('match', f=4)]),
+
+            # negation of must_not
+            query.Q('match', f=1),
+            query.Q('match', f=2),
+        ]
+    )
 
 def test_double_invert_returns_original_query():
     q = query.Match(f=42)
@@ -130,9 +162,15 @@ def test_double_invert_returns_original_query():
 
 def test_bool_query_gets_inverted_internally():
     q = query.Bool(must_not=[query.Match(f=42)], must=[query.Match(g='v')])
-    q = ~q
 
-    assert q == query.Bool(must=[query.Match(f=42)], must_not=[query.Match(g='v')])
+    assert ~q == query.Bool(
+        should=[
+            # negating must
+            query.Bool(must_not=[query.Match(g='v')]),
+            # negating must_not
+            query.Match(f=42),
+        ]
+    )
 
 def test_match_all_or_something_is_match_all():
     q1 = query.MatchAll()
@@ -158,11 +196,17 @@ def test_or_bool_doesnt_loop_infinitely_issue_96():
 
     assert q == query.Bool(should=[query.Bool(must_not=[query.Match(f=42)]), query.Bool(must_not=[query.Match(f=47)])])
 
-def test_bool_with_only_should_will_append_another_query_with_or():
-    qb = query.Bool(should=[query.Match(f='v')])
+def test_bool_will_append_another_query_with_or():
+    qb = query.Bool(should=[query.Match(f='v'), query.Match(f='v2'),])
     q = query.Match(g=42)
 
-    assert (q | qb) == query.Bool(should=[query.Match(f='v'), q])
+    assert (q | qb) == query.Bool(should=[query.Match(f='v'), query.Match(f='v2'), q])
+
+def test_bool_queries_with_only_should_get_concatenated():
+    q1 = query.Bool(should=[query.Match(f=1), query.Match(f=2),])
+    q2 = query.Bool(should=[query.Match(f=3), query.Match(f=4),])
+
+    assert (q1 | q2) == query.Bool(should=[query.Match(f=1), query.Match(f=2),query.Match(f=3), query.Match(f=4),])
 
 def test_two_bool_queries_append_one_to_should_if_possible():
     q1 = query.Bool(should=[query.Match(f='v')])
@@ -198,6 +242,11 @@ def test_Q_translates_double_underscore_to_dots_in_param_names():
 
     assert {'comment.author': 'honza'} == q._params
 
+def test_Q_doesn_translate_double_underscore_to_dots_in_param_names():
+    q = query.Q('match', comment__author='honza', _expand__to_dot=False)
+
+    assert {'comment__author': 'honza'} == q._params
+
 def test_Q_constructs_simple_query_from_dict():
     q = query.Q({'match': {'f': 'value'}})
 
@@ -231,12 +280,12 @@ def test_Q_raises_error_on_unknown_query():
     with raises(Exception):
         query.Q('not a query', f='value')
 
-def test_match_all_plus_anything_is_anything():
+def test_match_all_and_anything_is_anything():
     q = query.MatchAll()
 
     s = query.Match(f=42)
-    assert q+s == s
-    assert s+q == s
+    assert q&s == s
+    assert s&q == s
 
 def test_function_score_with_functions():
     q = query.Q('function_score', functions=[query.SF('script_score', script="doc['comment_count'] * _score")])

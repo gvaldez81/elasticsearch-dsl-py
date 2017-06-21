@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+import collections
+
 from six import iteritems, add_metaclass
 from six.moves import map
 
@@ -8,21 +10,11 @@ from .exceptions import UnknownDslObject, ValidationException
 SKIP_VALUES = ('', None)
 
 def _wrap(val, obj_wrapper=None):
-    if isinstance(val, dict):
+    if isinstance(val, collections.Mapping):
         return AttrDict(val) if obj_wrapper is None else obj_wrapper(val)
     if isinstance(val, list):
         return AttrList(val)
     return val
-
-def _make_dsl_class(base, name, params_def=None, suffix=''):
-    """
-    Generate a DSL class based on the name of the DSL object and it's parameters
-    """
-    attrs = {'name': name}
-    if params_def:
-        attrs['_param_defs'] = params_def
-    cls_name = str(''.join(s.title() for s in name.split('_')) + suffix)
-    return type(cls_name, (base, ), attrs)
 
 class AttrList(object):
     def __init__(self, l, obj_wrapper=None):
@@ -117,7 +109,7 @@ class AttrDict(object):
 
     def __getattr__(self, attr_name):
         try:
-            return _wrap(self._d_[attr_name])
+            return self.__getitem__(attr_name)
         except KeyError:
             raise AttributeError(
                 '%r object has no attribute %r' % (self.__class__.__name__, attr_name))
@@ -213,16 +205,16 @@ class DslBase(object):
         except KeyError:
             raise UnknownDslObject('DSL class `%s` does not exist in %s.' % (name, cls._type_name))
 
-    def __init__(self, **params):
+    def __init__(self, _expand__to_dot=True, **params):
         self._params = {}
         for pname, pvalue in iteritems(params):
-            if '__' in pname:
+            if '__' in pname and _expand__to_dot:
                 pname = pname.replace('__', '.')
             self._setattr(pname, pvalue)
 
     def _repr_params(self):
         """ Produce a repr of all our parameters to be used in __repr__. """
-        return  ', '.join(
+        return ', '.join(
             '%s=%r' % (n.replace('.', '__'), v)
             for (n, v) in sorted(iteritems(self._params))
             # make sure we don't include empty typed params
@@ -290,7 +282,7 @@ class DslBase(object):
                 '%r object has no attribute %r' % (self.__class__.__name__, name))
 
         # wrap nested dicts in AttrDict for convenient access
-        if isinstance(value, dict):
+        if isinstance(value, collections.Mapping):
             return AttrDict(value)
         return value
 
@@ -363,10 +355,11 @@ class ObjectBase(AttrDict):
         for k, v in iteritems(self._d_):
             try:
                 f = self._doc_type.mapping[k]
-                if f._coerce:
-                    v = f.serialize(v)
             except KeyError:
                 pass
+            else:
+                if f._coerce:
+                    v = f.serialize(v)
 
             # don't serialize empty values
             # careful not to include numeric zeros
@@ -401,14 +394,12 @@ class ObjectBase(AttrDict):
         self.clean()
 
 def merge(data, new_data):
-    if not (isinstance(data, (AttrDict, dict))
-            and isinstance(new_data, (AttrDict, dict))):
+    if not (isinstance(data, (AttrDict, collections.Mapping))
+            and isinstance(new_data, (AttrDict, collections.Mapping))):
         raise ValueError('You can only merge two dicts! Got %r and %r instead.' % (data, new_data))
 
     for key, value in iteritems(new_data):
-        if key in data and isinstance(data[key], (AttrDict, dict)):
+        if key in data and isinstance(data[key], (AttrDict, collections.Mapping)):
             merge(data[key], value)
         else:
             data[key] = value
-
-

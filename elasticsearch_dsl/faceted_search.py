@@ -1,11 +1,10 @@
 from datetime import timedelta, datetime
-from six import iteritems, itervalues
-from functools import partial
+from six import iteritems, itervalues, string_types
 
 from .search import Search
 from .aggs import A
 from .utils import AttrDict
-from .result import Response
+from .response import Response
 from .query import Q
 
 __all__ = ['FacetedSearch', 'HistogramFacet', 'TermsFacet', 'DateHistogramFacet', 'RangeFacet']
@@ -106,9 +105,9 @@ class RangeFacet(Facet):
         f, t = self._ranges[filter_value]
         limits = {}
         if f is not None:
-            limits['from'] = f
+            limits['gte'] = f
         if t is not None:
-            limits['to'] = t
+            limits['lt'] = t
 
         return Q('range', **{
             self._params['field']: limits
@@ -141,7 +140,10 @@ class DateHistogramFacet(Facet):
         super(DateHistogramFacet, self).__init__(**kwargs)
 
     def get_value(self, bucket):
-        return datetime.utcfromtimestamp(int(bucket['key']) / 1000)
+        if not isinstance(bucket['key'], datetime):
+            return datetime.utcfromtimestamp(int(bucket['key']) / 1000)
+        else:
+            return bucket['key']
 
     def get_value_filter(self, filter_value):
         return Q('range', **{
@@ -153,35 +155,81 @@ class DateHistogramFacet(Facet):
 
 
 class FacetedResponse(Response):
-    def __init__(self, search, *args, **kwargs):
-        super(FacetedResponse, self).__init__(*args, **kwargs)
-        super(AttrDict, self).__setattr__('_search', search)
-
     @property
     def query_string(self):
-        return self._search._query
+        return self._faceted_search._query
 
     @property
     def facets(self):
         if not hasattr(self, '_facets'):
             super(AttrDict, self).__setattr__('_facets', AttrDict({}))
-            for name, facet in iteritems(self._search.facets):
+            for name, facet in iteritems(self._faceted_search.facets):
                 self._facets[name] = facet.get_values(
-                    self.aggregations['_filter_' + name][name]['buckets'],
-                    self._search.filter_values.get(name, ())
+                    getattr(getattr(self.aggregations, '_filter_' + name), name).buckets,
+                    self._faceted_search.filter_values.get(name, ())
                 )
         return self._facets
 
 
 class FacetedSearch(object):
+    """
+    Abstraction for creating faceted navigation searches that takes care of
+    composing the queries, aggregations and filters as needed as well as
+    presenting the results in an easy-to-consume fashion::
+
+        class BlogSearch(FacetedSearch):
+            index = 'blogs'
+            doc_types = [Blog, Post]
+            fields = ['title^5', 'category', 'description', 'body']
+
+            facets = {
+                'type': TermsFacet(field='_type'),
+                'category': TermsFacet(field='category'),
+                'weekly_posts': DateHistogramFacet(field='published_from', interval='week')
+            }
+
+            def search(self):
+                ' Override search to add your own filters '
+                s = super(BlogSearch, self).search()
+                return s.filter('term', published=True)
+
+        # when using:
+        blog_search = BlogSearch("web framework", filters={"category": "python"})
+
+        # supports pagination
+        blog_search[10:20]
+
+        response = blog_search.execute()
+
+        # easy access to aggregation results:
+        for category, hit_count, is_selected in response.facets.category:
+            print(
+                "Category %s has %d hits%s." % (
+                    category,
+                    hit_count,
+                    ' and is chosen' if is_selected else ''
+                )
+            )
+
+    """
     index = '_all'
     doc_types = ['_all']
     fields = ('*', )
     facets = {}
 
-    def __init__(self, query=None, filters={}):
+    def __init__(self, query=None, filters={}, sort=()):
+        """
+        :arg query: the text to search for
+        :arg filters: facet values to filter
+        :arg sort: sort information to be passed to :class:`~elasticsearch_dsl.Search`
+        """
         self._query = query
         self._filters = {}
+        # TODO: remove in 6.0
+        if isinstance(sort, string_types):
+            self._sort = (sort,)
+        else:
+            self._sort = sort
         self.filter_values = {}
         for name, value in iteritems(filters):
             self.add_filter(name, value)
@@ -204,7 +252,7 @@ class FacetedSearch(object):
         """
         # normalize the value into a list
         if not isinstance(filter_values, (tuple, list)):
-            if filter_values in (None, ''):
+            if filter_values is None:
                 return
             filter_values = [filter_values, ]
 
@@ -223,7 +271,7 @@ class FacetedSearch(object):
         Construct the Search object.
         """
         s = Search(doc_type=self.doc_types, index=self.index)
-        return s.response_class(partial(FacetedResponse, self))
+        return s.response_class(FacetedResponse)
 
     def query(self, search, query):
         """
@@ -267,7 +315,16 @@ class FacetedSearch(object):
         """
         Add highlighting for all the fields
         """
-        return search.highlight(*self.fields)
+        return search.highlight(*(f if '^' not in f else f.split('^', 1)[0]
+                                  for f in self.fields))
+
+    def sort(self, search):
+        """
+        Add sorting information to the request.
+        """
+        if self._sort:
+            search = search.sort(*self._sort)
+        return search
 
     def build_search(self):
         """
@@ -277,8 +334,14 @@ class FacetedSearch(object):
         s = self.query(s, self._query)
         s = self.filter(s)
         s = self.highlight(s)
+        s = self.sort(s)
         self.aggregate(s)
         return s
 
     def execute(self):
-        return self._s.execute()
+        """
+        Execute the search and return the response.
+        """
+        r = self._s.execute()
+        r._faceted_search = self
+        return r

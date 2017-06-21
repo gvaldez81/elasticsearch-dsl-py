@@ -1,14 +1,17 @@
+import collections
+
 from six import iteritems
 from itertools import chain
 
 from .utils import DslBase
-from .field import InnerObject, String
+from .field import InnerObject, Text
 from .connections import connections
 from .exceptions import IllegalOperation
+from .index import Index
 
 META_FIELDS = frozenset((
     'dynamic', 'transform', 'dynamic_date_formats', 'date_detection',
-    'numeric_detection', 'dynamic_templates'
+    'numeric_detection', 'dynamic_templates', 'enabled'
 ))
 
 class Properties(InnerObject, DslBase):
@@ -38,14 +41,23 @@ class Mapping(object):
         m.update_from_es(index, using)
         return m
 
+    def resolve_field(self, field_path):
+        field = self
+        for step in field_path.split('.'):
+            try:
+                field = field[step]
+            except KeyError:
+                return
+        return field
+
     def _collect_analysis(self):
         analysis = {}
         fields = []
         if '_all' in self._meta:
-            fields.append(String(**self._meta['_all']))
+            fields.append(Text(**self._meta['_all']))
 
         for f in chain(fields, self.properties._collect_fields()):
-            for analyzer_name in ('analyzer', 'index_analyzer', 'search_analyzer'):
+            for analyzer_name in ('analyzer', 'search_analyzer', 'search_quote_analyzer'):
                 if not hasattr(f, analyzer_name):
                     continue
                 analyzer = getattr(f, analyzer_name)
@@ -62,19 +74,9 @@ class Mapping(object):
         return analysis
 
     def save(self, index, using='default'):
-        # TODO: replace with creating an Index instance to avoid duplication
-        es = connections.get_connection(using)
-        if not es.indices.exists(index=index):
-            es.indices.create(index=index, body={'mappings': self.to_dict(), 'settings': {'analysis': self._collect_analysis()}})
-        else:
-            analysis = self._collect_analysis()
-            if analysis:
-                if es.cluster.state(index=index, metric='metadata')['metadata']['indices'][index]['state'] != 'close':
-                    # TODO: check if the analysis config is already there
-                    raise IllegalOperation(
-                        'You cannot update analysis configuration on an open index, you need to close index %s first.' % index)
-                es.indices.put_settings(index=index, body={'analysis': analysis})
-            es.indices.put_mapping(index=index, doc_type=self.doc_type, body=self.to_dict())
+        index = Index(index, using=using)
+        index.mapping(self)
+        return index.save()
 
     def update_from_es(self, index, using='default'):
         es = connections.get_connection(using)
@@ -88,7 +90,7 @@ class Mapping(object):
         # metadata like _all etc
         for name, value in iteritems(raw):
             if name != 'properties':
-                if isinstance(value, dict):
+                if isinstance(value, collections.Mapping):
                     self.meta(name, **value)
                 else:
                     self.meta(name, value)
@@ -144,7 +146,7 @@ class Mapping(object):
         if '_all' in meta:
             meta = meta.copy()
             _all = meta['_all'] = meta['_all'].copy()
-            for f in ('analyzer', 'search_analyzer', 'index_analyzer'):
+            for f in ('analyzer', 'search_analyzer', 'search_quote_analyzer'):
                 if hasattr(_all.get(f, None), 'to_dict'):
                     _all[f] = _all[f].to_dict()
         d[self.doc_type].update(meta)

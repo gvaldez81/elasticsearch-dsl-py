@@ -1,20 +1,16 @@
-from datetime import date
+import collections
+
+from datetime import date, datetime
 from dateutil import parser
 from six import itervalues
 from six.moves import map
 
-from .utils import DslBase, _make_dsl_class, ObjectBase, AttrDict, AttrList
+from .utils import DslBase, ObjectBase, AttrDict, AttrList
 from .exceptions import ValidationException
 
-__all__ = [
-    'construct_field', 'Field', 'Object', 'Nested', 'Date', 'String', 'Float', 'Double',
-    'Byte', 'Short', 'Integer', 'Long', 'Boolean', 'Ip', 'Attachment',
-    'GeoPoint', 'GeoShape', 'InnerObjectWrapper'
-]
-
 def construct_field(name_or_field, **params):
-    # {"type": "string", "index": "not_analyzed"}
-    if isinstance(name_or_field, dict):
+    # {"type": "text", "analyzer": "snowball"}
+    if isinstance(name_or_field, collections.Mapping):
         if params:
             raise ValueError('construct_field() cannot accept parameters when passing in a dict.')
         params = name_or_field.copy()
@@ -28,13 +24,13 @@ def construct_field(name_or_field, **params):
             name = params.pop('type')
         return Field.get_dsl_class(name)(**params)
 
-    # String()
+    # Text()
     if isinstance(name_or_field, Field):
         if params:
             raise ValueError('construct_field() cannot accept parameters when passing in a construct_field object.')
         return name_or_field
 
-    # "string", index="not_analyzed"
+    # "text", analyzer="snowball"
     return Field.get_dsl_class(name_or_field)(**params)
 
 class Field(DslBase):
@@ -49,6 +45,9 @@ class Field(DslBase):
         self._multi = kwargs.pop('multi', False)
         self._required = kwargs.pop('required', False)
         super(Field, self).__init__(*args, **kwargs)
+
+    def __getitem__(self, subfield):
+        return self._params.get('fields', {})[subfield]
 
     def _serialize(self, data):
         return data
@@ -78,8 +77,7 @@ class Field(DslBase):
     def clean(self, data):
         if data is not None:
             data = self.deserialize(data)
-        # FIXME: numeric 0
-        if not data and self._required:
+        if data in (None, [], {}) and self._required:
             raise ValidationException("Value required for this field.")
         return data
 
@@ -183,6 +181,8 @@ class InnerObject(object):
         return self._wrap(data)
 
     def _serialize(self, data):
+        if data is None:
+            return None
         return data.to_dict()
 
     def clean(self, data):
@@ -217,6 +217,8 @@ class Date(Field):
             return None
         if isinstance(data, date):
             return data
+        if isinstance(data, int):
+            return datetime.utcfromtimestamp(data / 1000)
 
         try:
             # TODO: add format awareness
@@ -228,32 +230,76 @@ class String(Field):
     _param_defs = {
         'fields': {'type': 'field', 'hash': True},
         'analyzer': {'type': 'analyzer'},
-        'index_analyzer': {'type': 'analyzer'},
         'search_analyzer': {'type': 'analyzer'},
     }
     name = 'string'
 
-    def _empty(self):
-        return ''
+class Text(Field):
+    _param_defs = {
+        'fields': {'type': 'field', 'hash': True},
+        'analyzer': {'type': 'analyzer'},
+        'search_analyzer': {'type': 'analyzer'},
+        'search_quote_analyzer': {'type': 'analyzer'},
+    }
+    name = 'text'
 
-FIELDS = (
-    'float',
-    'double',
-    'byte',
-    'short',
-    'integer',
-    'long',
-    'boolean',
-    'ip',
-    'attachment',
-    'geo_point',
-    'geo_shape',
-    'completion',
-)
+class Keyword(Field):
+    _param_defs = {
+        'fields': {'type': 'field', 'hash': True},
+        'search_analyzer': {'type': 'analyzer'},
+    }
+    name = 'keyword'
 
-# generate the query classes dynamically
-for f in FIELDS:
-    fclass = _make_dsl_class(Field, f)
-    globals()[fclass.__name__] = fclass
-    __all__.append(fclass.__name__)
+class Boolean(Field):
+    name = 'boolean'
 
+    def _deserialize(self, data):
+        if data is None:
+            return None
+        return bool(data)
+
+    def clean(self, data):
+        if data is not None:
+            data = self.deserialize(data)
+        if data is None and self._required:
+            raise ValidationException("Value required for this field.")
+        return data
+
+class Float(Field):
+    name = 'float'
+
+class HalfFloat(Field):
+    name = 'half_float'
+
+class Double(Field):
+    name = 'double'
+
+class Byte(Field):
+    name = 'byte'
+
+class Short(Field):
+    name = 'short'
+
+class Integer(Field):
+    name = 'integer'
+
+class Long(Field):
+    name = 'long'
+
+class Ip(Field):
+    name = 'ip'
+
+class Attachment(Field):
+    name = 'attachment'
+
+class GeoPoint(Field):
+    name = 'geo_point'
+
+class GeoShape(Field):
+    name = 'geo_shape'
+
+class Completion(Field):
+    name = 'completion'
+
+class Percolator(Field):
+    name = 'percolator'

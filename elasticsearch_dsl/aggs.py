@@ -1,16 +1,7 @@
-from .utils import DslBase, _make_dsl_class
+import collections
 
-__all__ = [
-    'A', 'Agg', 'Filter', 'Bucket', 'Children', 'DateHistogram', 'Filters',
-    'GeoDistance', 'GeohashGrid', 'Global', 'Histogram', 'Iprange', 'Missing',
-    'Nested', 'Range', 'ReverseNested', 'SignificantTerms', 'Terms', 'Avg',
-    'Cardinality', 'ExtendedStats', 'GeoBounds', 'Max', 'Min', 'Percentiles',
-    'PercenileRanks', 'ScriptedMetric', 'Stats', 'Sum', 'TopHits', 'ValueCount',
-    'AvgBucket', 'BucketScript', 'BucketSelector', 'CumulativeSum',
-    'Derivative', 'ExtendedStatsBucket', 'MaxBucket', 'MinBucket', 'MovingAvg',
-    'PercentilesBucket', 'SerialDiff', 'StatsBucket', 'SumBucket'
-]
-
+from .utils import DslBase
+from .response.aggs import BucketData, FieldBucketData, AggResponse, TopHitsData
 
 def A(name_or_agg, filter=None, **params):
     if filter is not None:
@@ -19,7 +10,7 @@ def A(name_or_agg, filter=None, **params):
         params['filter'] = filter
 
     # {"terms": {"field": "tags"}, "aggs": {...}}
-    if isinstance(name_or_agg, dict):
+    if isinstance(name_or_agg, collections.Mapping):
         if params:
             raise ValueError('A() cannot accept parameters when passing in a dict.')
         # copy to avoid modifying in-place
@@ -34,7 +25,7 @@ def A(name_or_agg, filter=None, **params):
         if aggs:
             params = params.copy()
             params['aggs'] = aggs
-        return Agg.get_dsl_class(agg_type)(**params)
+        return Agg.get_dsl_class(agg_type)(_expand__to_dot=False, **params)
 
     # Terms(...) just return the nested agg
     elif isinstance(name_or_agg, Agg):
@@ -50,10 +41,26 @@ class Agg(DslBase):
     _type_shortcut = staticmethod(A)
     name = None
 
+    def __contains__(self, key):
+        return False
+
+    def to_dict(self):
+        d = super(Agg, self).to_dict()
+        if 'meta' in d[self.name]:
+            d['meta'] = d[self.name].pop('meta')
+        return d
+
+    def result(self, search, data):
+        return AggResponse(self, search, data)
+
+
 class AggBase(object):
     _param_defs = {
         'aggs': {'type': 'agg', 'hash': True},
     }
+    def __contains__(self, key):
+        return key in self._params.get('aggs', {})
+
     def __getitem__(self, agg_name):
         agg = self._params.setdefault('aggs', {})[agg_name] # propagate KeyError
 
@@ -68,6 +75,9 @@ class AggBase(object):
 
     def __setitem__(self, agg_name, agg):
         self.aggs[agg_name] = A(agg)
+
+    def __iter__(self):
+        return iter(self.aggs)
 
     def _agg(self, bucket, name, agg_type, *args, **params):
         agg = self[name] = A(agg_type, *args, **params)
@@ -87,6 +97,9 @@ class AggBase(object):
 
     def pipeline(self, name, agg_type, *args, **params):
         return self._agg(False, name, agg_type, *args, **params)
+
+    def result(self, search, data):
+        return BucketData(self, search, data)
 
 
 class Bucket(AggBase, Agg):
@@ -121,57 +134,149 @@ class Filter(Bucket):
 class Pipeline(Agg):
     pass
 
-AGGS = (
-    (Bucket, 'children', None),
-    (Bucket, 'date_histogram', None),
-    (Bucket, 'date_range', None),
-    (Bucket, 'filters', {'filters': {'type': 'query', 'hash': True}}),
-    (Bucket, 'geo_distance', None),
-    (Bucket, 'geohash_grid', None),
-    (Bucket, 'geo_centroid', None),
-    (Bucket, 'global', None),
-    (Bucket, 'histogram', None),
-    (Bucket, 'iprange', None),
-    (Bucket, 'missing', None),
-    (Bucket, 'nested', None),
-    (Bucket, 'range', None),
-    (Bucket, 'reverse_nested', None),
-    (Bucket, 'significant_terms', None),
-    (Bucket, 'terms', None),
+# bucket aggregations
+class Filters(Bucket):
+    name = 'filters'
+    _param_defs = {
+        'filters': {'type': 'query', 'hash': True},
+        'aggs': {'type': 'agg', 'hash': True},
+    }
 
-    (Agg, 'avg', None),
-    (Agg, 'cardinality', None),
-    (Agg, 'extended_stats', None),
-    (Agg, 'geo_bounds', None),
-    (Agg, 'max', None),
-    (Agg, 'min', None),
-    (Agg, 'percentiles', None),
-    (Agg, 'percentile_ranks', None),
-    (Agg, 'scripted_metric', None),
-    (Agg, 'stats', None),
-    (Agg, 'sum', None),
-    (Agg, 'top_hits', None),
-    (Agg, 'value_count', None),
+class Children(Bucket):
+    name = 'children'
 
-    (Pipeline, 'avg_bucket', None),
-    (Pipeline, 'bucket_script', None),
-    (Pipeline, 'bucket_selector', None),
-    (Pipeline, 'cumulative_sum', None),
-    (Pipeline, 'derivative', None),
-    (Pipeline, 'extended_stats_bucket', None),
-    (Pipeline, 'max_bucket', None),
-    (Pipeline, 'min_bucket', None),
-    (Pipeline, 'moving_avg', None),
-    (Pipeline, 'percentiles_bucket', None),
-    (Pipeline, 'serial_diff', None),
-    (Pipeline, 'stats_bucket', None),
-    (Pipeline, 'sum_bucket', None),
-)
+class DateHistogram(Bucket):
+    name = 'date_histogram'
 
-# generate the aggregation classes dynamically
-for base, fname, params_def in AGGS:
-    # don't override the params def from AggBase
-    if params_def:
-        params_def.update(AggBase._param_defs)
-    fclass = _make_dsl_class(base, fname, params_def)
-    globals()[fclass.__name__] = fclass
+    def result(self, search, data):
+        return FieldBucketData(self, search, data)
+
+class DateRange(Bucket):
+    name = 'date_range'
+
+class GeoDistance(Bucket):
+    name = 'geo_distance'
+
+class GeohashGrid(Bucket):
+    name = 'geohash_grid'
+
+class GeoCentroid(Bucket):
+    name = 'geo_centroid'
+
+class Global(Bucket):
+    name = 'global'
+
+class Histogram(Bucket):
+    name = 'histogram'
+    def result(self, search, data):
+        return FieldBucketData(self, search, data)
+
+class Iprange(Bucket):
+    name = 'iprange'
+
+class Missing(Bucket):
+    name = 'missing'
+
+class Nested(Bucket):
+    name = 'nested'
+
+class Range(Bucket):
+    name = 'range'
+
+class ReverseNested(Bucket):
+    name = 'reverse_nested'
+
+class SignificantTerms(Bucket):
+    name = 'significant_terms'
+
+class Terms(Bucket):
+    name = 'terms'
+
+    def result(self, search, data):
+        return FieldBucketData(self, search, data)
+
+class Sampler(Bucket):
+    name = 'sampler'
+
+# metric aggregations
+class TopHits(Agg):
+    name = 'top_hits'
+
+    def result(self, search, data):
+        return TopHitsData(self, search, data)
+
+class Avg(Agg):
+    name = 'avg'
+
+class Cardinality(Agg):
+    name = 'cardinality'
+
+class ExtendedStats(Agg):
+    name = 'extended_stats'
+
+class GeoBounds(Agg):
+    name = 'geo_bounds'
+
+class Max(Agg):
+    name = 'max'
+
+class Min(Agg):
+    name = 'min'
+
+class Percentiles(Agg):
+    name = 'percentiles'
+
+class PercentileRanks(Agg):
+    name = 'percentile_ranks'
+
+class ScriptedMetric(Agg):
+    name = 'scripted_metric'
+
+class Stats(Agg):
+    name = 'stats'
+
+class Sum(Agg):
+    name = 'sum'
+
+class ValueCount(Agg):
+    name = 'value_count'
+
+# pipeline aggregations
+class AvgBucket(Pipeline):
+    name = 'avg_bucket'
+
+class BucketScript(Pipeline):
+    name = 'bucket_script'
+
+class BucketSelector(Pipeline):
+    name = 'bucket_selector'
+
+class CumulativeSum(Pipeline):
+    name = 'cumulative_sum'
+
+class Derivative(Pipeline):
+    name = 'derivative'
+
+class ExtendedStatsBucket(Pipeline):
+    name = 'extended_stats_bucket'
+
+class MaxBucket(Pipeline):
+    name = 'max_bucket'
+
+class MinBucket(Pipeline):
+    name = 'min_bucket'
+
+class MovingAvg(Pipeline):
+    name = 'moving_avg'
+
+class PercentilesBucket(Pipeline):
+    name = 'percentiles_bucket'
+
+class SerialDiff(Pipeline):
+    name = 'serial_diff'
+
+class StatsBucket(Pipeline):
+    name = 'stats_bucket'
+
+class SumBucket(Pipeline):
+    name = 'sum_bucket'

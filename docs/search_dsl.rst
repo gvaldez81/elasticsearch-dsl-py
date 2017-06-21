@@ -27,7 +27,7 @@ all changes to the object will result in a copy being created which contains
 the changes. This means you can safely pass the ``Search`` object to foreign
 code without fear of it modifying your objects.
 
-You can pass an instance of the low-level `elasticsearch client <http://elasticsearch-py.readthedocs.org/>`_ when
+You can pass an instance of the low-level `elasticsearch client <https://elasticsearch-py.readthedocs.io/>`_ when
 instantiating the ``Search`` object:
 
 .. code:: python
@@ -83,6 +83,19 @@ explicitly:
 .. code:: python
 
     print(s.to_dict())
+
+
+Delete By Query
+~~~~~~~~~~~~~~~
+You can delete the documents matching a search by calling ``delete`` on the ``Search`` object instead of
+``execute`` like this:
+
+.. code:: python
+
+    s = Search().query("match", title="python")
+    response = s.delete()
+
+
 
 Queries
 ~~~~~~~
@@ -158,22 +171,7 @@ Query objects can be combined using logical operators:
     ~Q("match", title="python")
     # {"bool": {"must_not": [...]}}
 
-You can also use the ``+`` operator:
-
-.. code:: python
-
-    Q("match", title='python') + Q("match", title='django')
-    # {"bool": {"must": [...]}}
-
-When using the ``+`` operator with ``Bool`` queries, it will merge them into a
-single ``Bool`` query:
-
-.. code:: python
-
-    Q("bool") + Q("bool")
-    # {"bool": {"..."}}
-
-When you call the ``.query()`` method multiple times, the ``+`` operator will
+When you call the ``.query()`` method multiple times, the ``&`` operator will
 be used internally:
 
 .. code:: python
@@ -217,10 +215,17 @@ Behind the scenes this will produce a ``Bool`` query and place the specified
     s = s.query('bool', filter=[Q('terms', tags=['search', 'python'])])
 
 
-
 If you want to use the post_filter element for faceted navigation, use the
 ``.post_filter()`` method.
 
+You can also ``exclude()`` items from your query like this:
+
+.. code:: python
+
+    s = Search()
+    s = s.exclude('terms', tags=['search', 'python'])
+
+which is shorthand for: ``s = s.query('bool', filter=[~Q('terms', tags=['search', 'python'])])``
 
 Aggregations
 ~~~~~~~~~~~~
@@ -395,7 +400,9 @@ To specify a suggest request on your ``Search`` object use the ``suggest`` metho
 
 The first argument is the name of the suggestions (name under which it will be
 returned), second is the actual text you wish the suggester to work on and the
-keyword arguments will be added to the suggest's json as-is.
+keyword arguments will be added to the suggest's json as-is which means that it
+should be one of ``term``, ``phrase`` or ``completion`` to indicate which type
+of suggester should be used.
 
 If you only wish to run the suggestion part of the search (via the ``_suggest``
 endpoint) you can do so via ``execute_suggest``:
@@ -410,7 +417,9 @@ endpoint) you can do so via ``execute_suggest``:
 Extra properties and parameters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-To set extra properties of the search request, use the ``.extra()`` method:
+To set extra properties of the search request, use the ``.extra()`` method.
+This can be used to define keys in the body that cannot be defined via a
+specific API method like ``explain`` or ``search_after``:
 
 .. code:: python
 
@@ -424,16 +433,18 @@ To set query parameters, use the ``.params()`` method:
 
 
 If you need to limit the fields being returned by elasticsearch, use the
-``fields()`` method:
+``source()`` method:
 
 .. code:: python
 
   # only return the selected fields
-  s = s.fields(['title', 'body'])
-  # reset the field selection
-  s = s.fields()
+  s = s.source(['title', 'body'])
   # don't return any fields, just the metadata
-  s = s.fields([])
+  s = s.source(False)
+  # explicitly include/exclude fields
+  s = s.source(include=["title"], exclude=["user.*"])
+  # reset the field selection
+  s = s.source(None)
 
 Serialization and Deserialization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -441,12 +452,22 @@ Serialization and Deserialization
 The search object can be serialized into a dictionary by using the
 ``.to_dict()`` method.
 
-You can also create a ``Search`` object from a ``dict``:
+You can also create a ``Search`` object from a ``dict`` using the ``from_dict``
+class method. This will create a new ``Search`` object and populate it using
+the data from the dict:
 
 .. code:: python
 
   s = Search.from_dict({"query": {"match": {"title": "python"}}})
 
+If you wish to modify an existing ``Search`` object, overriding it's
+properties, instead use the ``update_from_dict`` method that alters an instance
+**in-place**:
+
+.. code:: python
+
+  s = Search(index='i')
+  s.update_from_dict({"query": {"match": {"title": "python"}}, "size": 42})
 
 Response
 --------

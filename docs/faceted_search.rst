@@ -34,6 +34,11 @@ declaring a ``FacetedSearch`` subclass:
   values should be instances of any ``Facet`` subclass, for example: ``{'tags':
   TermsFacet(field='tags')}``
 
+``sort``
+  tuple or list of fields on which the results should be sorted. The format of
+  the individual fieldsa re to be the same as those passed to
+  :meth:`~elasticsearch_dsl.Search.sort`.
+
 
 Facets
 ~~~~~~
@@ -49,15 +54,15 @@ There are several different facets available:
 ``HistogramFacet``
   similar to ``DateHistogramFacet`` but for numerical values: ``HistogramFacet(field="rating", interval=2)``
 
-``Rangefacet``
+``RangeFacet``
   allows you to define your own ranges for a numerical fields:
-  ``Rangefacet(field="comment_count", ranges=[("few", (None, 2)), ("lots", (2, None))])``
+  ``RangeFacet(field="comment_count", ranges=[("few", (None, 2)), ("lots", (2, None))])``
 
 Advanced
 ~~~~~~~~
 
 If you require any custom behavior or modifications simply override one or more
-of the methods responsible for the class' functions. The two main methods are:
+of the methods responsible for the class' functions:
 
 ``search(self)``
   is responsible for constructing the ``Search`` object used. Override this if
@@ -67,6 +72,10 @@ of the methods responsible for the class' functions. The two main methods are:
 ``query(self, search)``
   adds the query postion of the search (if search input specified), by default
   using ``MultiField`` query. Override this if you want to modify the query type used.
+
+``highlight(self, search)``
+  defines the highlighting on the ``Search`` object and returns a new one.
+  Default behavior is to highlight on all fields specified for search.
 
 
 Usage

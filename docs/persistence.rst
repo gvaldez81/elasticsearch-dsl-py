@@ -13,20 +13,20 @@ The mapping definition follows a similar pattern to the query dsl:
 
 .. code:: python
 
-    from elasticsearch_dsl import Mapping, String, Nested
+    from elasticsearch_dsl import Keyword, Mapping, Nested, Text
 
     # name your type
     m = Mapping('my-type')
 
     # add fields
-    m.field('title', 'string')
+    m.field('title', 'text')
 
     # you can use multi-fields easily
-    m.field('category', 'string', fields={'raw': String(index='not_analyzed')})
+    m.field('category', 'text', fields={'raw': Keyword()})
 
     # you can also create a field manually
     comment = Nested()
-    comment.field('author', String())
+    comment.field('author', Text())
     comment.field('created_at', Date())
 
     # and attach it to the mapping
@@ -43,7 +43,7 @@ The mapping definition follows a similar pattern to the query dsl:
     By default all fields (with the exception of ``Nested``) will expect single
     values. You can always override this expectation during the field
     creation/definition by passing in ``multi=True`` into the constructor
-    (``m.field('tags', String(index='not_analyzed', multi=True))``). Then the
+    (``m.field('tags', Keyword(multi=True))``). Then the
     value of the field, even if the field hasn't been set, will be an empty
     list enabling you to write ``doc.tags.append('search')``.
 
@@ -73,7 +73,7 @@ Common field options:
 Analysis
 --------
 
-To specify ``analyzer`` values for ``String`` fields you can just use the name
+To specify ``analyzer`` values for ``Text`` fields you can just use the name
 of the analyzer (as a string) and either rely on the analyzer being defined
 (like built-in analyzers) or define the analyzer yourself manually.
 
@@ -108,7 +108,8 @@ If you want to create a model-like wrapper around your documents, use the
 .. code:: python
 
     from datetime import datetime
-    from elasticsearch_dsl import DocType, String, Date, Nested, Boolean, analyzer
+    from elasticsearch_dsl import DocType, Date, Nested, Boolean, \
+        analyzer, InnerObjectWrapper, Completion, Keyword, Text
 
     html_strip = analyzer('html_strip',
         tokenizer="standard",
@@ -116,20 +117,25 @@ If you want to create a model-like wrapper around your documents, use the
         char_filter=["html_strip"]
     )
 
+    class Comment(InnerObjectWrapper):
+        def age(self):
+            return datetime.now() - self.created_at
+
     class Post(DocType):
-        title = String()
-        title_suggest = Completion(payloads=True)
+        title = Text()
+        title_suggest = Completion()
         created_at = Date()
         published = Boolean()
-        category = String(
+        category = Text(
             analyzer=html_strip,
-            fields={'raw': String(index='not_analyzed')}
+            fields={'raw': Keyword()}
         )
 
         comments = Nested(
+            doc_class=Comment,
             properties={
-                'author': String(fields={'raw': String(index='not_analyzed')}),
-                'content': String(analyzer='snowball'),
+                'author': Text(fields={'raw': Keyword()}),
+                'content': Text(analyzer='snowball'),
                 'created_at': Date()
             }
         )
@@ -222,6 +228,28 @@ If the document is not found in elasticsearch an exception
     p = Post.get(id='not-in-es', ignore=404)
     p is None
 
+When you wish to retrive multiple documents at the same time by their ``id``
+you can use the ``mget`` method:
+
+.. code:: python
+
+    posts = Post.mget([42, 47, 256])
+
+``mget`` will, by default, raise a ``NotFoundError`` if any of the documents
+wasn't found and ``RequestError`` if any of the document had resulted in error.
+You can control this behavior by setting parameters:
+
+``raise_on_error``
+  If ``True`` (default) then any error will cause an exception to be raised.
+  Otherwise all documents containing errors will be treated as missing.
+
+``missing``
+  Can have three possible values: ``'none'`` (default), ``'raise'`` and
+  ``'skip'``. If a document is missing or errored it will either be replaced
+  with ``None``, an exception will be raised or the document will be skipped in
+  the output list entirely.
+
+
 All the information about the ``DocType``, including its ``Mapping`` can be
 accessed through the ``_doc_type`` attribute of the class:
 
@@ -269,7 +297,7 @@ To search for this document type, use the ``search`` class method:
     results = s.execute()
 
     # when you execute the search the results are wrapped in your document class (Post)
-    for posts in results:
+    for post in results:
         print(post.meta.score, post.title)
 
 Alternatively you can just take a ``Search`` object and restrict it to return
@@ -290,7 +318,7 @@ If you want to run suggestions, just use the ``suggest`` method on the
 .. code:: python
 
     s = Post.search()
-    s.suggest('title_suggestions', 'pyth', completion={'field': 'title_suggest'})
+    s = s.suggest('title_suggestions', 'pyth', completion={'field': 'title_suggest'})
 
     # you can even execute just the suggestions via the _suggest API
     suggestions = s.execute_suggest()
@@ -330,7 +358,7 @@ to map and pass any parameters to the ``MetaField`` class:
 .. code:: python
 
     class Post(DocType):
-        title = String()
+        title = Text()
 
         class Meta:
             all = MetaField(enabled=False)
@@ -350,7 +378,7 @@ in a migration:
 
 .. code:: python
 
-    from elasticsearch_dsl import Index, DocType, String
+    from elasticsearch_dsl import Index, DocType, Text, analyzer
 
     blogs = Index('blogs')
 
@@ -371,7 +399,17 @@ in a migration:
     # can also be used as class decorator when defining the DocType
     @blogs.doc_type
     class Post(DocType):
-        title = String()
+        title = Text()
+
+    # You can attach custom analyzers to the index
+
+    html_strip = analyzer('html_strip',
+        tokenizer="standard",
+        filter=["standard", "lowercase", "stop", "snowball"],
+        char_filter=["html_strip"]
+    )
+
+    blogs.analyzer(html_strip)
 
     # delete the index, ignore if it doesn't exist
     blogs.delete(ignore=404)
@@ -395,4 +433,3 @@ create specific copies:
     dev_blogs = blogs.clone('blogs', using='dev')
     # and change its settings
     dev_blogs.setting(number_of_shards=1)
-
